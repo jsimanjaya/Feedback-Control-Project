@@ -15,10 +15,10 @@ DEFAULTS = {
     "kp": 1.0, # propotional gain Kp
     "kd": 0.5, # derivative gain Kd
     "baseline_s": 2.0, 
-    "target_duty": 0.5, # target duty cycle
+    "target_duty": 0.25, # target duty cycle
     "hyst_frac": 0.30, # hysteresis fraction must be [0,1) 
 }
-TACTORS = ("Front_Left", "Front_Right", "Back_Left", "Back_Right")
+TACTORS = ("AP_Positive", "AP_Negative", "ML_Positive", "ML_Negative")
 
 def load_angles(path):
     """Load raw one-segment workbook angles and validate their time base."""
@@ -36,6 +36,37 @@ def load_angles(path):
     fs = 1/ dt # sampling frequency
 
     return time_s, ap_raw, ml_raw, fs, {"AP": ap_column, "ML": ml_column}
+
+def hysteresis(u, pos_on, neg_on, n0, hyst_frac):
+    """Convert a signed signal into −1, 0, +1 with hysteresis"""
+    pos_off = pos_on * (1 - hyst_frac)
+    neg_off = neg_on * (1 - hyst_frac)
+
+    state = np.zeros(len(u), dtype=int)
+
+    for i in range(n0, len(u)):
+        previous = state[i - 1]
+        value = u[i]
+
+        if previous == 1:
+            if value >= pos_off:
+                state[i] = 1
+            elif value <= neg_on:
+                state[i] = -1
+
+        elif previous == -1:
+            if value <= neg_off:
+                state[i] = -1
+            elif value >= pos_on:
+                state[i] = 1
+
+        else:
+            if value >= pos_on:
+                state[i] = 1
+            elif value <= neg_on:
+                state[i] = -1
+
+    return state
 
 def simulate(time_s, ap_raw, ml_raw, fs, cfg):
     n0 = int(round(cfg["baseline_s"] * fs)) # how many beginning samples make up the neutral baseline period
@@ -57,50 +88,75 @@ def simulate(time_s, ap_raw, ml_raw, fs, cfg):
     """ PD controller """
     ap_u = cfg["kp"] * ap_angle + cfg["kd"] * ap_vel
     ml_u = cfg["kp"] * ml_angle + cfg["kd"] * ml_vel
-    magnitude = np.hypot(ap_u, ml_u)
 
-    threshold_on = np.percentile(
-        magnitude[n0:], 
-        100 * (1 - cfg["target_duty"])
+    """ Derive one positive and one negative threshold per axis """
+    q = 100 * (1 - cfg["target_duty"]) # use 75th percentile
+
+    ap_posterior = ap_u[n0:]
+    ml_posterior = ml_u[n0:]
+
+    """
+    AP positive: flexion -> +1
+    AP negative: extension -> -1
+    ML positive: right bend -> +1
+    ML negative: left bend -> -1
+    """
+    ap_pos_threshold = np.percentile(ap_posterior[ap_posterior > 0], q)
+    ap_neg_threshold = -np.percentile(-ap_posterior[ap_posterior < 0], q) # selects negative values -> calculates the percentile -> convert to negative
+
+    ml_pos_threshold = np.percentile(ml_posterior[ml_posterior > 0], q)
+    ml_neg_threshold = -np.percentile(-ml_posterior[ml_posterior < 0], q)
+
+    # Output arrays
+    ap_state = hysteresis(
+        ap_u,
+        ap_pos_threshold,
+        ap_neg_threshold,
+        n0,
+        cfg["hyst_frac"],
     )
-    threshold_off = threshold_on * (1 - cfg["hyst_frac"]) 
-    
-    tactor_pairs = (
-        [0, 1], # positive AP (front)
-        [2, 3], # negative AP (back)
-        [1, 3], # positive ML (right)
-        [0, 2], # negative ML (left)
+
+    ml_state = hysteresis(
+        ml_u,
+        ml_pos_threshold,
+        ml_neg_threshold,
+        n0,
+        cfg["hyst_frac"],
     )
 
-    tactor_columns = np.zeros((len(time_s), 4), dtype=int)
-    active_direction = None
 
-    for i, (ap, ml, size) in enumerate(zip(ap_u, ml_u, magnitude)):
-        if i < n0:
-            continue
+    # Keep baseline output off
+    ap_state[:n0] = 0
+    ml_state[:n0] = 0
 
-        if abs(ap) >= abs(ml):
-            requested_direction = 0 if ap >= 0 else 1
-        else:
-            requested_direction = 2 if ml >= 0 else 3
-
-        if active_direction is None and size >= threshold_on:
-            active_direction = requested_direction
-        elif active_direction is not None and size < threshold_off:
-            active_direction = None
-        elif (active_direction is not None
-            and requested_direction != active_direction
-            and size >= threshold_on):
-            active_direction = requested_direction
-
-        if active_direction is not None:
-            tactor_columns[i, tactor_pairs[active_direction]] = 1
+    """
+    Four independent directional output channels:
+        positive AP -> front tactor pairs assigned as tactor[0]
+        negative AP -> back tactor pairs assigned as tactor[1]
+        positive ML -> right tactor pairs assigned as tactor[2]
+        negative ML -> left tactor pairs assigned as tactor[3]
+    """
+    tactors = np.zeros((len(time_s), 4), dtype=int)
+    tactors[ap_state == 1, 0] = 1   # positive AP / front
+    tactors[ap_state == -1, 1] = 1  # negative AP / back 
+    tactors[ml_state == 1, 2] = 1   # positive ML / right
+    tactors[ml_state == -1, 3] = 1  # negative ML / left 
 
     return {
-        "baseline_count": n0, "ap_angle": ap_angle, "ml_angle": ml_angle,
-        "ap_velocity": ap_vel, "ml_velocity": ml_vel, "ap_control": ap_u,
-        "ml_control": ml_u, "magnitude": magnitude, "threshold_on": threshold_on,
-        "threshold_off": threshold_off, "tactors": tactor_columns
+        "baseline_count": n0, 
+        "ap_angle": ap_angle, 
+        "ml_angle": ml_angle,
+        "ap_velocity": ap_vel, 
+        "ml_velocity": ml_vel, 
+        "ap_control": ap_u,
+        "ml_control": ml_u, 
+        "ap_state": ap_state,
+        "ml_state": ml_state,
+        "ap_pos_threshold": ap_pos_threshold,
+        "ap_neg_threshold": ap_neg_threshold,
+        "ml_pos_threshold": ml_pos_threshold,
+        "ml_neg_threshold": ml_neg_threshold,
+        "tactors": tactors,
     }
 
 
@@ -109,7 +165,7 @@ def save_results(time_s, ap_raw, ml_raw, result, cfg, output_dir, label, input_m
     stem = output_dir / label
     table = np.column_stack((time_s, ap_raw, ml_raw, result["ap_angle"], result["ml_angle"],
                              result["ap_velocity"], result["ml_velocity"], result["ap_control"],
-                             result["ml_control"], result["magnitude"], result["tactors"]))
+                             result["ml_control"], result["tactors"]))
     np.savetxt(f"{stem}_channels.csv", table, delimiter=",", fmt="%.6f",
                header=("Time_s,AP_Raw_deg,ML_Raw_deg,AP_Filtered_deg,ML_Filtered_deg,"
                        "AP_Velocity_deg_s,ML_Velocity_deg_s,AP_PD_u,ML_PD_u,PD_Magnitude,"
@@ -117,8 +173,7 @@ def save_results(time_s, ap_raw, ml_raw, result, cfg, output_dir, label, input_m
 
     # Four signal panels plus one separate, time-aligned panel per corner
     # tactor.  Separate panels make activation overlap and chatter visible.
-    fig, axes = plt.subplots(8, 1, figsize=(12, 14), sharex=True, constrained_layout=True,
-                             gridspec_kw={"height_ratios": [2, 2, 1, 2, 1, 1, 1, 1]})
+    fig, axes = plt.subplots(6, 1, figsize=(10, 10), sharex=True, constrained_layout=True)
     baseline_end = time_s[result["baseline_count"] - 1]
     axes[0].plot(time_s, result["ap_angle"], label="AP: flexion/extension", color="#005A9C")
     axes[0].plot(time_s, result["ml_angle"], label="ML: lateral bending", color="#D55E00")
@@ -132,26 +187,26 @@ def save_results(time_s, ap_raw, ml_raw, result, cfg, output_dir, label, input_m
     axes[1].set(ylabel="Signed PD control")
     axes[1].legend(loc="upper right", frameon=False)
 
-    axes[2].step(time_s, np.sign(result["ap_control"]), where="post", label="sign(AP PD)", color="#0072B2")
-    axes[2].step(time_s, np.sign(result["ml_control"]), where="post", label="sign(ML PD)", color="#E69F00", alpha=0.8)
-    axes[2].axhline(0, color="0.5", linewidth=0.7)
-    axes[2].set(yticks=(-1, 0, 1), yticklabels=("−", "0", "+"), ylabel="PD sign",
-                title="+AP = front, −AP = back | +ML = right, −ML = left")
-    axes[2].legend(loc="upper right", frameon=False)
+    axes[1].axhline(result["ap_pos_threshold"], color="#0072B2",
+                linestyle="--", label="AP positive threshold")
+    axes[1].axhline(result["ap_neg_threshold"], color="#0072B2",
+                    linestyle=":", label="AP negative threshold")
 
-    axes[3].plot(time_s, result["magnitude"], color="#6A3D9A", label="Combined magnitude")
-    axes[3].axhline(result["threshold_on"], color="#D32F2F", linestyle="--", label="ON threshold")
-    axes[3].axhline(result["threshold_off"], color="#EF6C00", linestyle=":", label="OFF threshold")
-    axes[3].set(ylabel="PD magnitude")
-    axes[3].legend(loc="upper right", frameon=False)
+    axes[1].axhline(result["ml_pos_threshold"], color="#E69F00",
+                    linestyle="--", label="ML positive threshold")
+    axes[1].axhline(result["ml_neg_threshold"], color="#E69F00",
+                    linestyle=":", label="ML negative threshold")
 
     colors = ("#009E73", "#CC79A7", "#56B4E9", "#E69F00")
-    for axis, channel, tactor, color in zip(axes[4:], result["tactors"].T, TACTORS, colors):
+    for axis, channel, tactor, color in zip(
+        axes[2:], result["tactors"].T, TACTORS, colors
+    ):
         axis.step(time_s, channel, where="post", color=color, linewidth=1.3)
-        axis.set(yticks=[0, 1], ylim=(-0.12, 1.12), ylabel=tactor.replace("_", "\n"))
+        axis.set(yticks=[0, 1], ylim=(-0.12, 1.12),
+                ylabel=tactor.replace("_", "\n"))
         axis.grid(axis="x", alpha=0.25)
     axes[-1].set(xlabel="Time (s)")
-    fig.suptitle(f"Four-direction vibrotactile feedback")
+    fig.suptitle(f"Four-direction vibrotactile feedback | +AP = front, −AP = back | +ML = right, −ML = left")
     fig.savefig(f"{stem}.png", dpi=220, facecolor="white")
     fig.savefig(f"{stem}.svg", facecolor="white")
     plt.close(fig)
@@ -166,8 +221,10 @@ def save_results(time_s, ap_raw, ml_raw, result, cfg, output_dir, label, input_m
             "negative_ML": "left bend -> Front_Left + Back_Left",
         },
         "controller": cfg,
-        "threshold_on": float(result["threshold_on"]),
-        "threshold_off": float(result["threshold_off"]), 
+        "ap_pos_threshold": float(result["ap_pos_threshold"]),
+        "ap_neg_threshold": float(result["ap_neg_threshold"]),
+        "ml_pos_threshold": float(result["ml_pos_threshold"]),
+        "ml_neg_threshold": float(result["ml_neg_threshold"]),
         "post_baseline_duty_pct": {name: float(100 * active[:, i].mean())
                                     for i, name in enumerate(TACTORS)},
         "total_active_cue_pct": float(100 * np.any(active, axis=1).mean()),
@@ -200,7 +257,13 @@ def main():
     result = simulate(time_s, ap_raw, ml_raw, fs, cfg)
     summary = save_results(time_s, ap_raw, ml_raw, result, cfg, args.output_dir,
                            args.input.stem, input_mapping)
-    print(f"Sample rate: {fs:.1f} Hz | ON threshold: {summary['threshold_on']:.3f}")
+    print(
+        f"Sample rate: {fs:.1f} Hz | "
+        f"AP thresholds: {summary['ap_neg_threshold']:.3f}, "
+        f"{summary['ap_pos_threshold']:.3f} | "
+        f"ML thresholds: {summary['ml_neg_threshold']:.3f}, "
+        f"{summary['ml_pos_threshold']:.3f}"
+    )
     print("Post-baseline duty (%): " + ", ".join(f"{key}={value:.1f}" for key, value in summary["post_baseline_duty_pct"].items()))
     print(f"Wrote four-direction figure, channel CSV, and summary to {args.output_dir}")
 
